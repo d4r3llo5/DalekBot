@@ -134,18 +134,13 @@ __interrupt void IsrTimerTACC1(void)
 			keepState = IntruderOperation(timerInterval);
 			TACCR0 = TimerValue();        	// Blink the LEDs based on cmd
 			nextObjective = SEEKING;			// Tell the MSP to go to seeking mode
-
-			/* Turn on the ADC10 converter */
-			ADC10AE0 = 0x08;		// Set ADC10 in to A3 (P2.3)
-			/* Set ADC Control Register (Refs Vcc, Vss); Sample hold time 16 cycles; Turn on; Interrupt enabled */
-			ADC10CTL0 = SREF_0 | ADC10SHT_2 | ADC10ON | ADC10IE | ENC | ADC10SC;
 		}
 		if ( currentObjective == SEEKING ) {
 			while ( !(IFG2 & UCA0TXIFG)) {};      	// Confirm that Tx Buff is empty
 				UCA0TXBUF = motorACmd;				// command M1
 			while ( !(IFG2 & UCA0TXIFG)) {};     	// Confirm that Tx Buff is empty
 				UCA0TXBUF = motorBCmd;				// command M2
-			keepState = 1;
+			keepState = 1;		// Handled elsewhere
 		}
 		if ( keepState == 0 ) {        // Done exterminating/Warning
 			// STOP ALL LIGHTS, DISABLE TIMER
@@ -157,13 +152,10 @@ __interrupt void IsrTimerTACC1(void)
 				/* Start the UART */
 				UCA0CTL1 &= ~UCSWRST;             // Enable USCI state mach
 				UCA0TXBUF = 0;                    // Init robot to stopped state
+				ADC10CTL0 |= ADC10ON | REFON | ADC10IE;	// Start ADC10 Interrupts
 
 				/* Start the ADC10 */
 				ADC10CTL0 |= ENC + ADC10SC;        // Enab ADC10 & start new sample
-			}
-			if ( currentObjective == SEEKING ) {
-				UCA0CTL1 &= 0xFF;                 // Disable USCI state mach
-				UCA0TXBUF = 0;                    // Init robot to stopped state
 			}
 			currentObjective =  nextObjective;
 			TACCR0 = TimerValue();        			// Set the timer for the next value
@@ -180,9 +172,9 @@ __interrupt void IsrTimerTACC1(void)
 			}
 		}
 		if ( currentObjective == SEEKING ) {
-			if ( ++ledCounter == 1200 ) {
+			if ( ++ledCounter == 300 ) {
 				ledCounter = 0;
-				P2OUT ^= 0x02;
+				P2OUT ^= 0x03;
 				ADC10CTL0 |= ENC + ADC10SC;        // Enab ADC10 & start new sample
 			}
 		}
@@ -197,17 +189,35 @@ __interrupt void IsrTimerTACC1(void)
 __interrupt void IsrAdc10FoundValue(void)
 {
 	while ( (ADC10CTL1 & ADC10BUSY) == 0x0001 );		// Wait for a stable read
-	if ( ADC10MEM > 0x01BB) {		// Did not find a person
-//		motorACmd = 0x00;
-//		motorBCmd = 0x00;
-		P2OUT |= 0x01;
-	} else {						// Found our target
-//		motorACmd = 0x7F;
-//		motorBCmd = 0xFF;
-		P2OUT &= ~(0x01);
+	P1OUT = 0x00;
+		//	less than 1.54V, Move slowly
+	if ( ADC10MEM < 0x027D ) {							// Lost 'sight' of person (634), 1.40V
+		motorACmd = 0x60;
+		motorBCmd = 0xE0;
+		__bic_SR_register_on_exit(CPUOFF);   // Clr prev. CPUOFF bit on stack
+	}
+		//	between 1.600V and 1.50V, Move fast
+	if ( ADC10MEM < 0x0295 && ADC10MEM > 0x0283 ) {		// Moving toward person (638)
+		motorACmd = 0x7F;
+		motorBCmd = 0xFF;
+		__bic_SR_register_on_exit(CPUOFF);   // Clr prev. CPUOFF bit on stack
+	}
+		// EXTERMINATE! (1.63V)
+	if ( ADC10MEM > 0x029E ) {						// Found our target
+		while ( !(IFG2 & UCA0TXIFG)) {};      	// Confirm that Tx Buff is empty
+			UCA0TXBUF = 0x00;				// command M1
+		while ( !(IFG2 & UCA0TXIFG)) {};     	// Confirm that Tx Buff is empty
+			UCA0TXBUF = 0x00;				// command M2
+
+		// Disable the interrupts for this state (ADC10 and UART)
+		UCA0CTL1 &= 0xFF;                 // Disable USCI state mach
+		ADC10CTL0 &= ~(ADC10ON | ADC10IE);
+
+		currentObjective = EXTERMINATE;			// Tell the MSP to go to EXTERMINATE
+		TACCR0 = TimerValue();        	// Blink the LEDs based on cmd
+		__bic_SR_register_on_exit(CPUOFF);   // Clr prev. CPUOFF bit on stack
 	}
 
-	__bic_SR_register_on_exit(CPUOFF);   // Clr prev. CPUOFF bit on stack
 	// to keep CPU awake upon return.
 
 } // end ISR
@@ -216,7 +226,10 @@ int main( void )
 {
 	// Stop watchdog timer to prevent time out reset
  	WDTCTL = WDTPW + WDTHOLD;
-	currentObjective = SEEKING;       // Debug only
+ 	P1DIR |= 0x01;                    // P1.0 = output (LED)
+ 	P1OUT = 0x01;
+
+	currentObjective = STANDBY;       // Debug only
 
 	/* Set up Pin directions for blinking headlights */
 	P2DIR = 0x07;        	// Set P2.{2, 1, 0} as output
@@ -235,7 +248,7 @@ int main( void )
 	UCA0BR1  = 0;                         // Map 1MHz -> 9600 (Tbl 15-4)
 
 	/** DEBUGGING ONLY **/
-	//P2IE = 0x10;			// Set Interrupt enabled for P2.3
+	P2IE = 0x10;			// Set Interrupt enabled for P2.3
 	P2IES = 0x00;			// Rising Edge
 	P2IFG = 0x00;
 	P2OUT = 0x00;
@@ -250,21 +263,24 @@ int main( void )
 	TACTL   = TASSEL_2 | ID_0 | MC_1;
 
 	/** DEBUG CODE FOR THE IR SENSOR */
-	/* Set ADC Control Register (Refs Vref, Vss); Sample hold time 16 cycles; Turn on */
-	ADC10AE1 = 0x10;		// Set ADC10 in to A3 (P4.3)
-	ADC10CTL1 |= INCH_12;
-	ADC10CTL0 = SREF_7 | ADC10SHT_2 | ADC10ON | ADC10IE;
+	/*
+	 * Set ADC Control Register (Refs Vref+, Vss);
+	 * 	Sample hold time 16 cycles;
+	 * 	Turn on, enable interrupts
+	 *
+	 * 	Use Internal 2.5V, turn it on
+	 */
+	ADC10AE0 = 0x08;		// Enable ADC10 in to A3 (P2.3)
+	ADC10CTL1 |= INCH_3;	// Set the Analog input to be A3
+	ADC10CTL0 = SREF_1 | ADC10SHT_2 | REF2_5V;
 
-	/* DEBUG ONLY FOR UART */
+	/* DEBUG ONLY FOR UART/Wall IR Sensor*/
 	UCA0TXBUF = 0;                     // Init robot to stopped state
 	UCA0CTL1 &= ~UCSWRST;             // Enable USCI state mach
 
 	TACCR0 = TimerValue();
 
-	TACTL |= TAIE;					// Turn on the timer interrupt
-//	while (1) {
-		_BIS_SR(LPM1_bits + GIE);                  // Enter LPM w/ IRQs enabled
-//	}
+	_BIS_SR(LPM1_bits + GIE);                  // Enter LPM w/ IRQs enabled
 
 	return 0;
 }
