@@ -1,15 +1,12 @@
 #include <stdint.h>
-#include "msp430x22x4.h"
+#include "msp430x22x4.h"           // chip-specific macros & defs
+#include "wireless.h"              // Wireless setup & function defs
 
 /*
   Pin usage list
-  P2.0 LED out for Dalek head
-  P2.1 LED out for Dalek head
-  P2.2 Fan controller (enable TIP102 chip transitor)
-  P2.3 ADC Analog Input A3 (for the IR Sensor)
-
-  DEBUG ONLY
-  P2.4 IR SESNOR
+  P4.4 LED out for Dalek head
+  P4.5 LED out for Dalek head
+  P4.3 Fan controller (enable TIP102 chip transitor, A12)
  */
 
 /*
@@ -28,8 +25,12 @@ enum DALEK_PRIMARY_OBJECTIVE {
 
 // Global values
 volatile enum DALEK_PRIMARY_OBJECTIVE currentObjective;
-volatile uint8_t motorACmd = 127;
-volatile uint8_t motorBCmd = 255;
+volatile uint8_t motorACmd = 0x60;
+volatile uint8_t motorBCmd = 0xE0;
+
+// Wifi
+static uint8_t len = 2;          // Packet Len = 3 bytes
+volatile uint8_t rxPkt[2];                // Buffer to store received pkt payload
 
 /*
   Determine if the head lights should continue blinking
@@ -89,26 +90,6 @@ uint16_t TimerValue() {
 	return timerIncrementor;
 }
 
-#pragma vector=PORT2_VECTOR
-__interrupt void IsrPort2(void)
-{
-	// Found an interrupt on PORT2.3
-	if ( (P2IFG & 0x10) == 0x10 ) {
-		/*
-		 * Turn off interrupt for P2.3
-		 * 	Move to the second stage, INTRUDER
-		 * 	Dalek should flash headlights somewhat quickly
-		 * 	Disable this timer, and enable the Timer IRQ
-		 */
-		if ( (P2IN & 0x10) == 0x10 ) {		// P2.4 is high
-			P2IE = 0x00;					// Turn off interrupts
-			currentObjective = WARNING;		// Change base command to WARNING
-			TACTL |= TAIE;					// Turn on the timer interrupt
-			TACCR0 = TimerValue();        	// Blink the LEDs based on cmd
-		}
-	}
-}
-
 /**
   Timer interrupt for the Dalek
 	  This has to handle events for:
@@ -128,7 +109,7 @@ __interrupt void IsrTimerTACC1(void)
 	case TAIV_TAIFG:
 		if ( currentObjective == EXTERMINATE ) {  // Turn on the Glitter gun
 			keepState = GlitterGunOperation(timerInterval);
-			nextObjective = RETURN;
+			nextObjective = STANDBY;
 		}
 		if ( currentObjective == WARNING ) {  // Intruder found routine
 			keepState = IntruderOperation(timerInterval);
@@ -146,7 +127,6 @@ __interrupt void IsrTimerTACC1(void)
 			// STOP ALL LIGHTS, DISABLE TIMER
 			if ( currentObjective == EXTERMINATE ) {
 				TACTL &= ~(TAIE);                      // Disable Timer
-				P2IE = 0x10;			// Set Interrupt enabled for P2.3
 			}
 			if ( currentObjective == WARNING ) {
 				/* Start the UART */
@@ -159,7 +139,7 @@ __interrupt void IsrTimerTACC1(void)
 			}
 			currentObjective =  nextObjective;
 			TACCR0 = TimerValue();        			// Set the timer for the next value
-			P2OUT &= ~(0x03);                     	// Turn off the Head LEDs
+			P4OUT &= ~(0x30);                     	// Turn off the Head LEDs
 			timerInterval = 0;
 			break;
 		}
@@ -167,14 +147,14 @@ __interrupt void IsrTimerTACC1(void)
 		if ( (currentObjective == WARNING) || (currentObjective == EXTERMINATE) ) {
 			if ( ++ledCounter == 25 ) {
 				ledCounter = 0;
-				P2OUT ^= 0x03;                          // Blink the head of Daleks
+				P4OUT ^= 0x30;                          // Blink the head of Daleks
 				timerInterval += 1;                      // Step fan on counter
 			}
 		}
 		if ( currentObjective == SEEKING ) {
-			if ( ++ledCounter == 300 ) {
+			if ( ++ledCounter == 150) {					// Run the ADC every 0.5s (as per spec)
 				ledCounter = 0;
-				P2OUT ^= 0x03;
+				P4OUT ^= 0x30;
 				ADC10CTL0 |= ENC + ADC10SC;        // Enab ADC10 & start new sample
 			}
 		}
@@ -191,19 +171,13 @@ __interrupt void IsrAdc10FoundValue(void)
 	while ( (ADC10CTL1 & ADC10BUSY) == 0x0001 );		// Wait for a stable read
 	P1OUT = 0x00;
 		//	less than 1.54V, Move slowly
-	if ( ADC10MEM < 0x027D ) {							// Lost 'sight' of person (634), 1.40V
+	if ( ADC10MEM < 0x0276 ) {							// Lost 'sight' of person (634), 1.40V
 		motorACmd = 0x60;
 		motorBCmd = 0xE0;
 		__bic_SR_register_on_exit(CPUOFF);   // Clr prev. CPUOFF bit on stack
 	}
-		//	between 1.600V and 1.50V, Move fast
-	if ( ADC10MEM < 0x0295 && ADC10MEM > 0x0283 ) {		// Moving toward person (638)
-		motorACmd = 0x7F;
-		motorBCmd = 0xFF;
-		__bic_SR_register_on_exit(CPUOFF);   // Clr prev. CPUOFF bit on stack
-	}
-		// EXTERMINATE! (1.63V)
-	if ( ADC10MEM > 0x029E ) {						// Found our target
+		// EXTERMINATE! (1.584V)
+	if ( ADC10MEM > 0x028D ) {						// Found our target
 		while ( !(IFG2 & UCA0TXIFG)) {};      	// Confirm that Tx Buff is empty
 			UCA0TXBUF = 0x00;				// command M1
 		while ( !(IFG2 & UCA0TXIFG)) {};     	// Confirm that Tx Buff is empty
@@ -222,6 +196,84 @@ __interrupt void IsrAdc10FoundValue(void)
 
 } // end ISR
 
+#pragma vector=PORT2_VECTOR
+__interrupt void PktRxedISR(void)
+//----------------------------------------------------------------------------
+// Func:  Packet Received ISR:  triggered by falling edge of GDO0.
+//        Parses pkt & sends 2 data bytes through UART to the host PC.
+// Args:  None
+// Retn:  None
+//----------------------------------------------------------------------------
+{
+  // Buffer Len for rxPkt = only address plus data bytes;
+  // pkt size byte not incl b/c it is stripped away within RX function.
+
+  uint8_t status[2];               // Buffer to store pkt status bytes
+  static uint8_t crcOk;            // Flag pkt was received w/ good CRC
+
+  if(TI_CC_GDO0_PxIFG & TI_CC_GDO0_PIN)         // chk GDO0 bit of P2 IFG Reg
+    crcOk = RFReceivePacket(rxPkt,&len,status); // Fetch packet from cc2500
+
+  TI_CC_GDO0_PxIFG &= ~TI_CC_GDO0_PIN;          // Reset GDO0 IRQ flag
+
+  if(crcOk)                     // If RXed pkt valid, send to screen via UART
+  {
+    P1OUT ^= 0x03;                       // Pkt RXed =>Toggle LEDs
+    if ( rxPkt[1] == 0xAA ) {
+    	// Turn on the next phase of our robot if it is on standby
+    	if ( currentObjective == STANDBY ) {
+    		currentObjective = WARNING;
+    		TACCR0 = TimerValue();
+    		TACTL |= TAIE;
+    	}
+    }
+    crcOk = 0;                           // Clear Pkt Received flag
+  }
+  TI_CC_SPIStrobe(TI_CCxxx0_SIDLE);      // Set cc2500 to idle mode.
+  TI_CC_SPIStrobe(TI_CCxxx0_SRX);        // Set cc2500 to RX mode.
+                                         // AutoCal @ IDLE to RX Transition
+}
+
+
+//----------------------------------------------------------------------------
+// FUNC:  Setup MSP430 Ports & Clocks and reset & config cc2500
+// ARGS:  none
+// RETN:  none
+//----------------------------------------------------------------------------
+void SetupAll(void)
+{
+  volatile uint16_t delay;
+
+  for(delay=0; delay<650; delay++);     // Empirical: cc2500 Pwr up settle
+
+  // set up clock system
+  BCSCTL1 = CALBC1_8MHZ;                // set DCO freq. from cal. data
+  BCSCTL2 |= DIVS_3;                    // SMCLK = MCLK/8 = 1MHz
+  DCOCTL  = CALDCO_8MHZ;                // set MCLK to 8MHz
+
+  // Port config
+  P1DIR |=  0x03;                       // Set LED pins to output
+  P1OUT &= ~0x03;                       // Clear LEDs
+
+  // Wireless Initialization
+  TI_CC_SPISetup();                     // Initialize SPI port
+  P2SEL = 0;                            // P2.6 & P2.7 = GDO0 & GDO2
+  TI_CC_PowerupResetCCxxxx();           // Reset cc2500
+  writeRFSettings();                    // Write RF settings to config reg
+
+  TI_CC_GDO0_PxIES |=  TI_CC_GDO0_PIN;  // Int on GDO0 fall. edge (end of pkt)
+  TI_CC_GDO0_PxIFG &= ~TI_CC_GDO0_PIN;  // Clear  GDO0 IRQ flag
+  TI_CC_GDO0_PxIE  |=  TI_CC_GDO0_PIN;  // Enable GDO0 IRQ
+  TI_CC_SPIStrobe(TI_CCxxx0_SRX);       // Initialize cc2500 in RX mode.
+
+  TI_CC_SPIWriteReg(TI_CCxxx0_CHANNR,   10);  // Set Your Own Channel Number
+                                             // AFTER writeRFSettings (???)
+
+  for(delay=0; delay<650; delay++);     // Empirical: Let cc2500 finish setup
+
+  P1OUT = 0x02;                         // Setup done => Turn on green LED
+}
+
 int main( void )
 {
 	// Stop watchdog timer to prevent time out reset
@@ -232,7 +284,7 @@ int main( void )
 	currentObjective = STANDBY;       // Debug only
 
 	/* Set up Pin directions for blinking headlights */
-	P2DIR = 0x07;        	// Set P2.{2, 1, 0} as output
+	P4DIR = 0x30;        	// Set P2.{2, 1, 0} as output
 
 	/* Set up robot motion */
 	/* Set up pin direction for UART */
@@ -246,13 +298,6 @@ int main( void )
 	UCA0MCTL = UCBRS0;                    // Map 1MHz -> 9600 (Tbl 15-4)
 	UCA0BR0  = 104;                       // Map 1MHz -> 9600 (Tbl 15-4)
 	UCA0BR1  = 0;                         // Map 1MHz -> 9600 (Tbl 15-4)
-
-	/** DEBUGGING ONLY **/
-	P2IE = 0x10;			// Set Interrupt enabled for P2.3
-	P2IES = 0x00;			// Rising Edge
-	P2IFG = 0x00;
-	P2OUT = 0x00;
-	/** END OF DEBUG CODE **/
 
 	/**
 	 * Set the timer:
@@ -270,15 +315,15 @@ int main( void )
 	 *
 	 * 	Use Internal 2.5V, turn it on
 	 */
-	ADC10AE0 = 0x08;		// Enable ADC10 in to A3 (P2.3)
-	ADC10CTL1 |= INCH_3;	// Set the Analog input to be A3
+	ADC10AE1 = 0x01;		// Enable ADC10 in to A12 (P4.3)
+	ADC10CTL1 |= INCH_12;	// Set the Analog input to be A12
 	ADC10CTL0 = SREF_1 | ADC10SHT_2 | REF2_5V;
 
-	/* DEBUG ONLY FOR UART/Wall IR Sensor*/
+	/* UART For the robot */
 	UCA0TXBUF = 0;                     // Init robot to stopped state
 	UCA0CTL1 &= ~UCSWRST;             // Enable USCI state mach
 
-	TACCR0 = TimerValue();
+	SetupAll();
 
 	_BIS_SR(LPM1_bits + GIE);                  // Enter LPM w/ IRQs enabled
 
