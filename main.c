@@ -24,13 +24,27 @@ enum DALEK_PRIMARY_OBJECTIVE {
 };
 
 // Global values
-volatile enum DALEK_PRIMARY_OBJECTIVE currentObjective;
 volatile uint8_t motorACmd = 0x60;
 volatile uint8_t motorBCmd = 0xE0;
 
 // Wifi
-static uint8_t len = 2;          // Packet Len = 3 bytes
-volatile uint8_t rxPkt[2];                // Buffer to store received pkt payload
+static uint8_t len = 2;       	   // Packet Len = 3 bytes
+volatile uint8_t rxPkt[2] = {0, 0};      // Buffer to store received pkt payload
+
+volatile uint8_t closestSensor;				// Keeps track of the closest IR Sensor
+
+volatile uint8_t currObj = 0;		// Counter for parsing through the command array
+// Objectives
+volatile uint8_t objectives[] = {
+	STANDBY,		// 0
+	WARNING,		// 1
+	STANDBY,		// 2
+	WARNING,		// 3
+	SEEKING,		// 4
+	EXTERMINATE,	// 5
+	RETURN			// 6
+};
+
 
 /*
   Determine if the head lights should continue blinking
@@ -72,7 +86,7 @@ uint16_t GlitterGunOperation( uint16_t elapsedTime ) {
  */
 uint16_t TimerValue() {
 	uint16_t timerIncrementor = 0;
-	switch ( currentObjective ) {
+	switch ( objectives[currObj] ) {
 		case (EXTERMINATE):   // Exterminate! Blink every 25ms!
 			timerIncrementor = 5715;
 			break;
@@ -104,19 +118,18 @@ __interrupt void IsrTimerTACC1(void)
 	static volatile uint16_t ledCounter = 0;      // Count if should blink leds
 	static volatile uint16_t timerInterval = 0;    // Count how long action should take
 	volatile uint16_t keepState = 0;           // Stay in the current objective? (0 move on)
-	enum DALEK_PRIMARY_OBJECTIVE nextObjective = STANDBY;
+	uint16_t delay;
+
 	switch ( __even_in_range( TAIV, 10 ) ) {
 	case TAIV_TAIFG:
-		if ( currentObjective == EXTERMINATE ) {  // Turn on the Glitter gun
+		if ( objectives[currObj] == EXTERMINATE ) {  // Turn on the Glitter gun
 			keepState = GlitterGunOperation(timerInterval);
-			nextObjective = STANDBY;
 		}
-		if ( currentObjective == WARNING ) {  // Intruder found routine
+		if ( objectives[currObj] == WARNING ) {  // Intruder found routine
 			keepState = IntruderOperation(timerInterval);
 			TACCR0 = TimerValue();        	// Blink the LEDs based on cmd
-			nextObjective = SEEKING;			// Tell the MSP to go to seeking mode
 		}
-		if ( currentObjective == SEEKING ) {
+		if ( objectives[currObj] == SEEKING ) {
 			while ( !(IFG2 & UCA0TXIFG)) {};      	// Confirm that Tx Buff is empty
 				UCA0TXBUF = motorACmd;				// command M1
 			while ( !(IFG2 & UCA0TXIFG)) {};     	// Confirm that Tx Buff is empty
@@ -125,33 +138,39 @@ __interrupt void IsrTimerTACC1(void)
 		}
 		if ( keepState == 0 ) {        // Done exterminating/Warning
 			// STOP ALL LIGHTS, DISABLE TIMER
-			if ( currentObjective == EXTERMINATE ) {
-				TACTL &= ~(TAIE);                      // Disable Timer
+			if ( objectives[currObj] == EXTERMINATE ) {
+				TACTL &= ~(TAIE);                     	// Disable Timer
+				currObj = 0xFF;							// Roll over the objective counter
+				for(delay=0; delay<650; delay++);     // Empirical: Let cc2500 finish setup
+				TI_CC_GDO0_PxIE  |=  TI_CC_GDO0_PIN;  // Enable GDO0 IRQ
 			}
-			if ( currentObjective == WARNING ) {
-				/* Start the UART */
-				UCA0CTL1 &= ~UCSWRST;             // Enable USCI state mach
-				UCA0TXBUF = 0;                    // Init robot to stopped state
-				ADC10CTL0 |= ADC10ON | REFON | ADC10IE;	// Start ADC10 Interrupts
+			if ( objectives[currObj] == WARNING ) {
+				TI_CC_GDO0_PxIE  |=  TI_CC_GDO0_PIN;  // Enable GDO0 IRQ
+				if ( currObj == 3 ) {
+					/* Start the UART */
+					UCA0CTL1 &= ~UCSWRST;             // Enable USCI state mach
+					UCA0TXBUF = 0;                    // Init robot to stopped state
+					ADC10CTL0 |= ADC10ON | REFON | ADC10IE;	// Start ADC10 Interrupts
 
-				/* Start the ADC10 */
-				ADC10CTL0 |= ENC + ADC10SC;        // Enab ADC10 & start new sample
+					/* Start the ADC10 */
+					ADC10CTL0 |= ENC + ADC10SC;        // Enab ADC10 & start new sample
+				}
 			}
-			currentObjective =  nextObjective;
+			currObj += 1;							// Incrementing Command counter
 			TACCR0 = TimerValue();        			// Set the timer for the next value
 			P4OUT &= ~(0x30);                     	// Turn off the Head LEDs
 			timerInterval = 0;
 			break;
 		}
 		// Blink the LEDs
-		if ( (currentObjective == WARNING) || (currentObjective == EXTERMINATE) ) {
+		if ( (objectives[currObj]== WARNING) || (objectives[currObj] == EXTERMINATE) ) {
 			if ( ++ledCounter == 25 ) {
 				ledCounter = 0;
 				P4OUT ^= 0x30;                          // Blink the head of Daleks
 				timerInterval += 1;                      // Step fan on counter
 			}
 		}
-		if ( currentObjective == SEEKING ) {
+		if ( objectives[currObj] == SEEKING ) {
 			if ( ++ledCounter == 150) {					// Run the ADC every 0.5s (as per spec)
 				ledCounter = 0;
 				P4OUT ^= 0x30;
@@ -187,7 +206,7 @@ __interrupt void IsrAdc10FoundValue(void)
 		UCA0CTL1 &= 0xFF;                 // Disable USCI state mach
 		ADC10CTL0 &= ~(ADC10ON | ADC10IE);
 
-		currentObjective = EXTERMINATE;			// Tell the MSP to go to EXTERMINATE
+		currObj += 1;					// Tell the MSP to go to next phase
 		TACCR0 = TimerValue();        	// Blink the LEDs based on cmd
 		__bic_SR_register_on_exit(CPUOFF);   // Clr prev. CPUOFF bit on stack
 	}
@@ -209,6 +228,7 @@ __interrupt void PktRxedISR(void)
   // pkt size byte not incl b/c it is stripped away within RX function.
 
   uint8_t status[2];               // Buffer to store pkt status bytes
+  uint16_t delay;
   static uint8_t crcOk;            // Flag pkt was received w/ good CRC
 
   if(TI_CC_GDO0_PxIFG & TI_CC_GDO0_PIN)         // chk GDO0 bit of P2 IFG Reg
@@ -219,13 +239,20 @@ __interrupt void PktRxedISR(void)
   if(crcOk)                     // If RXed pkt valid, send to screen via UART
   {
     P1OUT ^= 0x03;                       // Pkt RXed =>Toggle LEDs
-    if ( rxPkt[1] == 0xAA ) {
-    	// Turn on the next phase of our robot if it is on standby
-    	if ( currentObjective == STANDBY ) {
-    		currentObjective = WARNING;
-    		TACCR0 = TimerValue();
-    		TACTL |= TAIE;
+    if ( (rxPkt[1] & 0x0F) == 0x05 ) {
+    		// If it is at one of the sensors
+    	if ( currObj < 3 ) {
+    		TI_CC_GDO0_PxIE  &=  ~(TI_CC_GDO0_PIN);  // Disable GDO0 IRQ
+    		currObj += 1;
+			TACCR0 = TimerValue();
+			TACTL |= TAIE;
     	}
+		if ( (rxPkt[1] & 0xF0) == 0x50 ) {		// first sensor
+			closestSensor = 0;
+		}
+		if ( (rxPkt[1] & 0xF0) == 0xA0 ) {		// second sensor
+			closestSensor = 1;
+		}
     }
     crcOk = 0;                           // Clear Pkt Received flag
   }
@@ -266,7 +293,7 @@ void SetupAll(void)
   TI_CC_GDO0_PxIE  |=  TI_CC_GDO0_PIN;  // Enable GDO0 IRQ
   TI_CC_SPIStrobe(TI_CCxxx0_SRX);       // Initialize cc2500 in RX mode.
 
-  TI_CC_SPIWriteReg(TI_CCxxx0_CHANNR,   10);  // Set Your Own Channel Number
+  TI_CC_SPIWriteReg(TI_CCxxx0_CHANNR,   0);  // Set Your Own Channel Number
                                              // AFTER writeRFSettings (???)
 
   for(delay=0; delay<650; delay++);     // Empirical: Let cc2500 finish setup
@@ -281,7 +308,7 @@ int main( void )
  	P1DIR |= 0x01;                    // P1.0 = output (LED)
  	P1OUT = 0x01;
 
-	currentObjective = STANDBY;       // Debug only
+	objectives[currObj];
 
 	/* Set up Pin directions for blinking headlights */
 	P4DIR = 0x30;        	// Set P2.{2, 1, 0} as output
@@ -324,6 +351,7 @@ int main( void )
 	UCA0CTL1 &= ~UCSWRST;             // Enable USCI state mach
 
 	SetupAll();
+	P4OUT &= ~(0x30);
 
 	_BIS_SR(LPM1_bits + GIE);                  // Enter LPM w/ IRQs enabled
 
