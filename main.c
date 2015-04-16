@@ -31,7 +31,7 @@ volatile uint8_t motorBCmd = 0xE0;
 static uint8_t len = 2;       	   // Packet Len = 3 bytes
 volatile uint8_t rxPkt[2] = {0, 0};      // Buffer to store received pkt payload
 
-volatile uint8_t closestSensor;				// Keeps track of the closest IR Sensor
+volatile uint8_t activeSensors = 0;				// Keeps track of the IR Sensor states
 
 volatile uint8_t currObj = 0;		// Counter for parsing through the command array
 // Objectives
@@ -239,20 +239,39 @@ __interrupt void PktRxedISR(void)
   if(crcOk)                     // If RXed pkt valid, send to screen via UART
   {
     P1OUT ^= 0x03;                       // Pkt RXed =>Toggle LEDs
-    if ( (rxPkt[1] & 0x0F) == 0x05 ) {
+    if ( (rxPkt[1] & 0x0F) == 0x05 ) {		// Good byte of data (0x1100 is a check to use)
     		// If it is at one of the sensors
-    	if ( currObj < 3 ) {
-    		TI_CC_GDO0_PxIE  &=  ~(TI_CC_GDO0_PIN);  // Disable GDO0 IRQ
-    		currObj += 1;
-			TACCR0 = TimerValue();
-			TACTL |= TAIE;
+    	if ( currObj == 0 ) {				// Depending on where we are in the code
+    		// The very first sensor has been triggered
+			if ( (rxPkt[1] & 0xF0) == 0x50 ) {		// first sensor hit first time
+				activeSensors |= 0x01;
+				TI_CC_GDO0_PxIE  &=  ~(TI_CC_GDO0_PIN);  // Disable GDO0 IRQ
+				currObj += 1;
+				TACCR0 = TimerValue();
+				TACTL |= TAIE;
+			}
+    	} else if ( currObj == 2 ) {				// Second sensor hit first time
+			if ( (rxPkt[1] & 0xF0) == 0xA0 ) {
+				activeSensors |= 0x04;
+				currObj += 1;
+				TACCR0 = TimerValue();
+				TACTL |= TAIE;
+			}
+    	} else {
+			if ( (rxPkt[1] & 0xF0) == 0x50 ) {		// first sensor
+				activeSensors |= 0x01;				// Turn on
+			}
+			if ( (rxPkt[1] & 0xF0) == 0xA0 ) {		// second sensor
+				activeSensors |= 0x04;				// Turn on
+			}
     	}
-		if ( (rxPkt[1] & 0xF0) == 0x50 ) {		// first sensor
-			closestSensor = 0;
-		}
-		if ( (rxPkt[1] & 0xF0) == 0xA0 ) {		// second sensor
-			closestSensor = 1;
-		}
+    }
+    if ( (rxPkt[1] & 0x0F) == 0x0A ) {			// Signal came in, the IR is off
+    	 if ( (rxPkt[1] & 0xF0 ) == 0x50 ){
+    		 activeSensors &= ~(0x01);			// First sensor is off
+    	} if ( (rxPkt[1] & 0xF0) == 0xA0 ) {
+    		activeSensors &= ~(0x04);			// Second
+    	}
     }
     crcOk = 0;                           // Clear Pkt Received flag
   }
@@ -331,7 +350,7 @@ int main( void )
 	 *   Measured frequency: 1.143MHz, Divided by 1 = 800KHz
 	 *   Up mode
 	 **/
-	// SMCLK | Div by 1 | Up Mode | Interrupts
+	// SMCLK | Div by 1 | Up Mode
 	TACTL   = TASSEL_2 | ID_0 | MC_1;
 
 	/** DEBUG CODE FOR THE IR SENSOR */
