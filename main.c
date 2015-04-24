@@ -86,10 +86,10 @@ uint16_t IntruderOperation( uint16_t elapsedTime ) {
  */
 uint16_t GlitterGunOperation( uint16_t elapsedTime ) {
 	if ( elapsedTime < 64 ) {        // Should be a 4s timer (64 is 8s @ 0.25 steps)
-		P2OUT |= (0x04);               // Turn on 4.6 (glitter gun)
+		P2OUT |= (0x02);               // Turn on 2.2 (glitter gun)
 		return 1;
 	} else {
-		P2OUT &= ~(0x04);               // Turn off 4.6 (glitter gun)
+		P2OUT &= ~(0x02);               // Turn off 4.6 (glitter gun)
 		return 0;                       // End extermination sequence
 	}
 }
@@ -152,12 +152,6 @@ __interrupt void IsrTimerTACC1(void)
 				motorBCmd = 0xC0;
 				lostTarget = 0;
 			}
-			if ( motorACmd == 0x40 ) {
-				motorACmd = 0x41;
-			}
-			if ( motorBCmd == 0xC0 ) {
-				motorBCmd = 0xC1;
-			}
 			while ( !(IFG2 & UCA0TXIFG)) {};      	// Confirm that Tx Buff is empty
 			UCA0TXBUF = motorACmd;				// command M1
 			while ( !(IFG2 & UCA0TXIFG)) {};     	// Confirm that Tx Buff is empty
@@ -172,7 +166,7 @@ __interrupt void IsrTimerTACC1(void)
 				for(delay=0; delay<650; delay++);     	// Empirical: Let cc2500 finish setup
 				TI_CC_GDO0_PxIE  |=  TI_CC_GDO0_PIN;  	// Enable GDO0 IRQ
 				for(delay=0; delay<650; delay++);     	// Empirical: Let cc2500 finish setup
-				P2OUT &= 0x03;						// Stop yelling
+				P2OUT &= 0x01;						// Stop yelling
 			}
 			if ( objectives[currObj] == WARNING ) {
 				TI_CC_GDO0_PxIE  |=  TI_CC_GDO0_PIN; 	// Enable GDO0 IRQ
@@ -183,10 +177,10 @@ __interrupt void IsrTimerTACC1(void)
 					UCA0TXBUF = 0;						// Init robot to stopped state
 					lostTarget = 1;
 
-					//					ADC10CTL0 |= ADC10ON | REFON;			// Start ADC10
-					//					ADC10CTL0 |= ENC | ADC10SC | ADC10IE;	// Enab ADC10, Interrupts, start new sample
-					//
-					//					TACTL &= ~(TAIE);					// Stop moving and look for the person
+					ADC10CTL0 |= ADC10ON | REFON;			// Start ADC10
+					ADC10CTL0 |= ENC | ADC10SC | ADC10IE;	// Enab ADC10, Interrupts, start new sample
+
+					TACTL &= ~(TAIE);					// Stop moving and look for the person
 				}
 			}
 			currObj += 1;							// Incrementing Command counter
@@ -198,39 +192,52 @@ __interrupt void IsrTimerTACC1(void)
 		// Blink the LEDs
 		if ( (objectives[currObj] == WARNING) || (objectives[currObj] == EXTERMINATE) ) {
 			if ( ++ledCounter == 25 ) {
+				P2OUT ^= 0x08;
 				ledCounter = 0;
 				timerInterval += 1;                      // Step fan on counter
 			}
 		}
 		if ( objectives[currObj] == SEEKING ) {
-			if ( (ledCounter % 72) == 0 ) {
-				if ( timerInterval < 12 ) {
-					motorACmd += 4;
-					motorBCmd -= 4;
-				} else if ( (timerInterval < 54) && (timerInterval > 29) ) {
-					motorACmd -= 4;
-					motorBCmd += 4;
-				} else if ( (timerInterval < 84) && (timerInterval > 71) ) {
-					motorACmd += 4;
-					motorBCmd -= 4;
-				} else if ( timerInterval > 83 ) {
-					motorACmd += 4;
-					motorBCmd += 4;
-				} else {
-					P2OUT ^= 0x08;
+			if ( lastReadVoltage > minMoveTemp ) {
+				timerInterval = 0;
+			}
+			if ( ramping ) {							// Looking for the person
+				if ( (ledCounter % 144) == 0 ) {		// Pan around
+					if ( timerInterval < 4 ) {			// Pan Left
+						P1OUT = 0x01;
+						motorACmd += 6;
+						motorBCmd -= 6;
+					} else if ( (timerInterval < 16) && (timerInterval > 7) ) {		// Center and pan right
+						P1OUT = 0x00;
+						motorACmd -= 6;
+						motorBCmd += 6;
+					} else if ( (timerInterval < 32) && (timerInterval > 23) ) {		// Center and pan Left
+						P1OUT = 0x01;
+						motorACmd += 6;
+						motorBCmd -= 6;
+					} else if ( (timerInterval < 38) && (timerInterval > 33) ) {        // go back to center
+						motorACmd -= 6;
+						motorBCmd += 6;
+					} else if ( (timerInterval < 42) && (timerInterval > 37) ) {        // go forward
+						motorACmd += 6;
+						motorBCmd += 6;
+					} else if ( (timerInterval < 46) && (timerInterval > 41) ) {        // coast to a stop (should probably not need to get here)
+						motorACmd -= 6;
+						motorBCmd -= 6;
+					}
+					if ( timerInterval == 45 ) {										// Go back to scanning
+						P2OUT ^= 0x08;
+						motorACmd = 0x40;
+						motorBCmd = 0xC0;
+						timerInterval = 0;
+					} else {
+						timerInterval++;
+					}
 				}
-				if ( timerInterval == 108 ) {
-					P2OUT ^= 0x08;
-					motorACmd = 0x40;
-					motorBCmd = 0xC0;
-					timerInterval = 0;
-				} else {
-					timerInterval++;
-				}
-				//				TACTL &= ~(TAIE);					// Stop moving and look for the person
-				//				ADC10CTL0 |= ENC + ADC10SC;        // Enab ADC10 & start new sample
 			}
 			if ( ++ledCounter == 288) {					// Run the ADC about every 0.5s (as per spec)
+				TACTL &= ~(TAIE);					// Stop moving and look for the person
+				ADC10CTL0 |= ENC + ADC10SC;        // Enab ADC10 & start new sample
 				ledCounter = 0;
 			}
 		}
@@ -246,7 +253,7 @@ __interrupt void IsrTimerTACC1(void)
 __interrupt void IsrAdc10FoundValue(void)
 {
 	while ( (ADC10CTL1 & ADC10BUSY) == 0x0001 );		// Wait for a stable read
-	P2OUT ^= 0x08;                          // Blink the head of Daleks
+	lastReadVoltage = ADC10MEM;
 	//	Less than 0.25V, Rotate to look for it
 	if ( ADC10MEM < maxScanTemp	) {							// Lost 'sight' of person (634), 1.40V
 		if ( !ramping ) {
@@ -263,25 +270,21 @@ __interrupt void IsrAdc10FoundValue(void)
 	//
 	//	// EXTERMINATE! (0.80V)
 	if ( ADC10MEM > maxVoltage ) {						// Found our target
-		motorACmd = 0x00;
-		motorBCmd = 0x00;
 		lostTarget = 0;
 		ramping = 0;
+		while ( !(IFG2 & UCA0TXIFG)) {};      	// Confirm that Tx Buff is empty
+		UCA0TXBUF = 0x00;				// command M1
+		while ( !(IFG2 & UCA0TXIFG)) {};     	// Confirm that Tx Buff is empty
+		UCA0TXBUF = 0x00;				// command M2
+		//		 Disable the interrupts for this state (ADC10 and UART)
+		UCA0CTL1 &= 0xFF;                 // Disable USCI state mach
+		ADC10CTL0 &= ~(ADC10ON | ADC10IE);
+		P2OUT = 0x01;					// Turn off asking for tea
+
+		currObj += 1;					// Tell the MSP to go to next phase
+		TACCR0 = TimerValue();        	// Blink the LEDs based on cmd
+		__bic_SR_register_on_exit(CPUOFF);   // Clr prev. CPUOFF bit on stack
 	}
-	//		while ( !(IFG2 & UCA0TXIFG)) {};      	// Confirm that Tx Buff is empty
-	//		UCA0TXBUF = 0x00;				// command M1
-	//		while ( !(IFG2 & UCA0TXIFG)) {};     	// Confirm that Tx Buff is empty
-	//		UCA0TXBUF = 0x00;				// command M2
-	//		//		 Disable the interrupts for this state (ADC10 and UART)
-	//		UCA0CTL1 &= 0xFF;                 // Disable USCI state mach
-	//		ADC10CTL0 &= ~(ADC10ON | ADC10IE);
-	//		P2OUT = 0x03;					// Turn off asking for tea
-	//
-	//		currObj += 1;					// Tell the MSP to go to next phase
-	//		TACCR0 = TimerValue();        	// Blink the LEDs based on cmd
-	//		__bic_SR_register_on_exit(CPUOFF);   // Clr prev. CPUOFF bit on stack
-	//		return
-	//	}
 
 	// to keep CPU awake upon return.
 	TACTL |= TAIE;
@@ -452,7 +455,7 @@ int main( void )
 
 	/* UART For the robot, set to defaults */
 	while ( !(IFG2 & UCA0TXIFG)) {};      	// Confirm that Tx Buff is empty
-	UCA0TXBUF = 0;                     // Init robot to stopped state
+	UCA0TXBUF  = 0;                     // Init robot to stopped state
 	UCA0CTL1 &= ~UCSWRST;             // Enable USCI state mach
 
 	/**
@@ -464,12 +467,11 @@ int main( void )
 	TACTL   = TASSEL_2 | ID_0 | MC_1 | TAIE;
 
 	// Fan, LED, and Audio Circuit
-	P2OUT = 0x0B;
+	P2OUT = 0x00;
 	P2SEL |= ~(0x0F);
-	P2DIR |= 0x0B;
+	P2DIR = 0x0F;
 
 	// Start the robot
-	currObj = 5;
 	TACCR0 = TimerValue();
 
 	/*
@@ -484,9 +486,7 @@ int main( void )
 	ADC10CTL0 = SREF_1 | ADC10SHT_2 | REF2_5V;
 	SetupAll();
 
-	//setAmbientTemp();
-	motorACmd = 0x40;
-	motorBCmd = 0xC0;
+	setAmbientTemp();
 	_BIS_SR(LPM1_bits + GIE);                  // Enter LPM w/ IRQs enabled
 
 	return 0;
